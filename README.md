@@ -14,9 +14,6 @@ mostrando como chegou a cada número.
 
 ## 2. Demonstração
 
-<!-- TODO: capturas do Claude Desktop respondendo com o servidor conectado -->
-_Capturas de tela em breve._
-
 Dez perguntas reais, da simples à difícil, com as ferramentas chamadas, o SQL
 gerado e as respostas, estão em [`exemplos/perguntas.md`](exemplos/perguntas.md).
 Um trecho:
