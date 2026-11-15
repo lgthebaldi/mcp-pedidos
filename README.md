@@ -238,8 +238,6 @@ exemplos/            perguntas reais e o log da sessão
 
 ## 9. Como foi construído
 
-<!-- RASCUNHO: revisar antes de publicar; é a narrativa do autor -->
-
 O projeto foi construído com o **Claude Code**, em etapas pequenas, com um
 commit por etapa. Antes de cada etapa, o Claude Code explicava o plano, e eu
 aprovava ou ajustava. As regras do trabalho ficaram em [`CLAUDE.md`](CLAUDE.md).
