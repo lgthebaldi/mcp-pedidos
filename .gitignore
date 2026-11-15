@@ -17,3 +17,6 @@ dist/
 .vscode/
 .idea/
 .DS_Store
+
+# Log de chamadas do servidor (fonte dos exemplos)
+logs/

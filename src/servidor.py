@@ -11,7 +11,12 @@ Para rodar manualmente (fica esperando mensagens MCP na entrada padrão):
 """
 
 import inspect
+import json
+import logging
 import os
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -27,6 +32,16 @@ from validador import ConsultaInvalida
 
 # Permite apontar para outro arquivo (útil em testes); o padrão é data/pedidos.db.
 CAMINHO_BANCO = Path(os.environ.get("MCP_PEDIDOS_DB", banco.CAMINHO_PADRAO))
+
+# Registro de cada chamada de ferramenta, uma linha JSON por chamada. É a
+# fonte dos exemplos em exemplos/perguntas.md: mostra o que o Claude pediu
+# de fato (inclusive o SQL exato e os erros), sem depender da memória do
+# modelo. Fica fora do git. MCP_PEDIDOS_LOG vazio desliga o registro.
+CAMINHO_LOG = os.environ.get(
+    "MCP_PEDIDOS_LOG", str(Path(__file__).resolve().parent.parent / "logs" / "chamadas.jsonl")
+)
+_trava_log = threading.Lock()  # ferramentas síncronas rodam em threads
+_logger = logging.getLogger("mcp_pedidos")
 
 NomeTabela = Literal[tuple(banco.DESCRICOES)]
 
@@ -59,6 +74,44 @@ SOMENTE_LEITURA = ToolAnnotations(
 )
 
 servidor = MCPServer("pedidos", instructions=INSTRUCOES)
+
+
+def _registrar(registro):
+    if not CAMINHO_LOG:
+        return
+    try:
+        caminho = Path(CAMINHO_LOG)
+        caminho.parent.mkdir(parents=True, exist_ok=True)
+        linha = json.dumps(registro, ensure_ascii=False, default=str)
+        with _trava_log, caminho.open("a", encoding="utf-8") as arquivo:
+            arquivo.write(linha + "\n")
+    except OSError as erro:
+        # Falha no log nunca derruba a ferramenta; avisa no stderr.
+        _logger.warning("Não foi possível gravar o log de chamadas: %s", erro)
+
+
+def _executar(ferramenta, argumentos, funcao):
+    """Roda `funcao()`, registra a chamada e converte erros esperados em ToolError.
+
+    ToolError é o jeito de devolver um erro que o modelo consegue ler: a
+    chamada volta com is_error=True e a mensagem no conteúdo. Qualquer outra
+    exceção chegaria ao Claude só como "Error executing tool".
+    """
+    inicio = time.monotonic()
+    registro = {
+        "momento": datetime.now().isoformat(timespec="seconds"),
+        "ferramenta": ferramenta,
+        "argumentos": argumentos,
+    }
+    try:
+        resultado = funcao()
+    except (ConsultaInvalida, banco.ErroConsulta) as erro:
+        registro.update(duracao_ms=round((time.monotonic() - inicio) * 1000), erro=str(erro))
+        _registrar(registro)
+        raise ToolError(str(erro)) from erro
+    registro.update(duracao_ms=round((time.monotonic() - inicio) * 1000), resultado=resultado)
+    _registrar(registro)
+    return resultado
 
 
 # Tipos de retorno. Declarar o formato com TypedDict faz o SDK publicar um
@@ -104,10 +157,8 @@ def listar_tabelas() -> ListaTabelas:
     os dados e ainda não souber quais tabelas existem. Depois use
     descrever_tabela para ver as colunas das tabelas que interessam.
     """
-    try:
-        return {"tabelas": banco.listar_tabelas(CAMINHO_BANCO)}
-    except banco.ErroConsulta as erro:
-        raise ToolError(str(erro)) from erro
+    return _executar("listar_tabelas", {},
+                     lambda: {"tabelas": banco.listar_tabelas(CAMINHO_BANCO)})
 
 
 @servidor.tool(title="Descrever tabela", annotations=SOMENTE_LEITURA)
@@ -126,10 +177,8 @@ def descrever_tabela(
     Leia a descrição das colunas: ela traz regras importantes, como o fato de
     valor_total já incluir a taxa de entrega.
     """
-    try:
-        return banco.descrever_tabela(tabela, CAMINHO_BANCO)
-    except banco.ErroConsulta as erro:
-        raise ToolError(str(erro)) from erro
+    return _executar("descrever_tabela", {"tabela": tabela},
+                     lambda: banco.descrever_tabela(tabela, CAMINHO_BANCO))
 
 
 class ResultadoConsulta(TypedDict):
@@ -174,18 +223,17 @@ def consultar(
         "Sem ponto e vírgula entre comandos e sem comandos de escrita."
     ))],
 ) -> ResultadoConsulta:
-    try:
+    def rodar():
         resultado = banco.executar_consulta(sql, CAMINHO_BANCO)
-    except (ConsultaInvalida, banco.ErroConsulta) as erro:
-        raise ToolError(str(erro)) from erro
+        resposta = {**resultado, "linhas_devolvidas": len(resultado["linhas"])}
+        if resultado["truncado"]:
+            resposta["aviso"] = (
+                f"O resultado tinha mais de {banco.LIMITE_LINHAS} linhas e foi cortado. "
+                "Agregue com GROUP BY ou use LIMIT para obter o número completo."
+            )
+        return resposta
 
-    resposta = {**resultado, "linhas_devolvidas": len(resultado["linhas"])}
-    if resultado["truncado"]:
-        resposta["aviso"] = (
-            f"O resultado tinha mais de {banco.LIMITE_LINHAS} linhas e foi cortado. "
-            "Agregue com GROUP BY ou use LIMIT para obter o número completo."
-        )
-    return resposta
+    return _executar("consultar", {"sql": sql}, rodar)
 
 
 class ResumoPeriodo(TypedDict):
@@ -226,10 +274,8 @@ def resumo_periodo(
 
     Os dados cobrem de 2026-08-01 a 2026-10-31.
     """
-    try:
-        return banco.resumo_periodo(data_inicio, data_fim, CAMINHO_BANCO)
-    except banco.ErroConsulta as erro:
-        raise ToolError(str(erro)) from erro
+    return _executar("resumo_periodo", {"data_inicio": data_inicio, "data_fim": data_fim},
+                     lambda: banco.resumo_periodo(data_inicio, data_fim, CAMINHO_BANCO))
 
 
 if __name__ == "__main__":
