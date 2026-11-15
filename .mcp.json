@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "pedidos": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${CLAUDE_PROJECT_DIR:-.}",
+        "python",
+        "src/servidor.py"
+      ],
+      "env": {}
+    }
+  }
+}
