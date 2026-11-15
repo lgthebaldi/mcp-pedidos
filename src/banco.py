@@ -35,6 +35,75 @@ _ACOES_PERMITIDAS = {
 _FUNCOES_BLOQUEADAS = {"load_extension", "readfile", "writefile", "edit", "fts3_tokenizer"}
 
 
+# Documentação de negócio do banco. É o que o Claude lê para entender o
+# significado de cada tabela e coluna, então faz parte do "prompt" do
+# servidor. Um teste garante que toda coluna real tenha descrição aqui.
+DESCRICOES = {
+    "restaurantes": {
+        "descricao": "Restaurantes parceiros cadastrados na plataforma (30 no total).",
+        "colunas": {
+            "id": "Identificador do restaurante.",
+            "nome": "Nome fantasia do restaurante.",
+            "categoria": "Tipo de cozinha (Pizzaria, Japonesa, Hambúrguer etc.).",
+            "bairro": "Bairro onde o restaurante fica.",
+        },
+    },
+    "clientes": {
+        "descricao": (
+            "Clientes da plataforma. Não há nome nem dado pessoal, apenas o "
+            "bairro de entrega e a data de cadastro."
+        ),
+        "colunas": {
+            "id": "Identificador do cliente.",
+            "bairro": "Bairro onde o cliente recebe os pedidos.",
+            "data_cadastro": "Data de cadastro no formato AAAA-MM-DD.",
+        },
+    },
+    "pedidos": {
+        "descricao": (
+            "Um registro por pedido feito entre 01/08/2026 e 31/10/2026. "
+            "Liga-se a clientes (cliente_id) e a restaurantes (restaurante_id)."
+        ),
+        "colunas": {
+            "id": "Identificador do pedido.",
+            "cliente_id": "Cliente que fez o pedido (clientes.id).",
+            "restaurante_id": "Restaurante que recebeu o pedido (restaurantes.id).",
+            "data_hora": (
+                "Momento do pedido, texto no formato 'AAAA-MM-DD HH:MM:SS' (hora local). "
+                "Use strftime('%Y-%m', data_hora) para mês, strftime('%H', ...) para hora "
+                "e strftime('%w', ...) para dia da semana (0 = domingo)."
+            ),
+            "valor_total": (
+                "Valor pago em R$, JÁ INCLUINDO a taxa de entrega "
+                "(soma dos itens + taxa_entrega). Para o valor só da comida, "
+                "use valor_total - taxa_entrega."
+            ),
+            "taxa_entrega": "Taxa de entrega em R$ (0 quando o frete foi grátis).",
+            "status": (
+                "'entregue' ou 'cancelado'. Pedidos cancelados não têm "
+                "tempo_entrega_min nem nota; decida se devem entrar em médias de valor."
+            ),
+            "tempo_entrega_min": "Minutos entre o pedido e a entrega. NULL se cancelado.",
+            "nota": "Avaliação do cliente, de 1 a 5. NULL se não avaliou ou se cancelado.",
+        },
+    },
+    "itens_pedido": {
+        "descricao": "Itens de cada pedido (um pedido tem de 1 a 4 itens diferentes).",
+        "colunas": {
+            "id": "Identificador do item.",
+            "pedido_id": "Pedido ao qual o item pertence (pedidos.id).",
+            "nome_item": "Nome do prato ou produto.",
+            "quantidade": "Quantidade pedida desse item.",
+            "preco_unitario": "Preço de uma unidade em R$.",
+        },
+    },
+}
+
+# Colunas de texto com até este número de valores distintos têm todos os
+# valores listados em descrever_tabela (ex.: status, bairro, categoria).
+MAXIMO_VALORES_LISTADOS = 15
+
+
 class ErroConsulta(Exception):
     """A consulta chegou ao banco, mas falhou (erro de SQL, tempo, permissão)."""
 
@@ -59,6 +128,102 @@ def abrir_conexao(caminho=CAMINHO_PADRAO):
     conexao = sqlite3.connect(f"{caminho.as_uri()}?mode=ro", uri=True)
     conexao.set_authorizer(_authorizer)
     return conexao
+
+
+def _abrir_conexao_interna(caminho):
+    """Conexão somente leitura SEM o authorizer, para consultas fixas do servidor.
+
+    O authorizer bloqueia PRAGMA, que é necessário para ler a estrutura das
+    tabelas. Esta conexão só executa consultas escritas neste arquivo, nunca
+    texto vindo do Claude, e continua em `mode=ro`.
+    """
+    conexao = abrir_conexao(caminho)
+    conexao.set_authorizer(None)
+    return conexao
+
+
+def listar_tabelas(caminho=CAMINHO_PADRAO):
+    """Devolve as tabelas do banco com descrição e número de linhas."""
+    conexao = _abrir_conexao_interna(caminho)
+    try:
+        nomes = [linha[0] for linha in conexao.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY rowid"
+        )]
+        return [
+            {
+                "nome": nome,
+                "descricao": DESCRICOES.get(nome, {}).get("descricao", ""),
+                # Seguro: `nome` veio do próprio sqlite_master, não do usuário.
+                "linhas": conexao.execute(f'SELECT COUNT(*) FROM "{nome}"').fetchone()[0],
+            }
+            for nome in nomes
+        ]
+    finally:
+        conexao.close()
+
+
+def descrever_tabela(nome, caminho=CAMINHO_PADRAO):
+    """Devolve colunas, tipos, descrições e exemplos de valores de uma tabela."""
+    conexao = _abrir_conexao_interna(caminho)
+    try:
+        existentes = {linha[0] for linha in conexao.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
+        # O nome só é interpolado no SQL depois de conferido contra a lista
+        # real de tabelas, o que impede injeção por esse parâmetro.
+        if nome not in existentes:
+            raise ErroConsulta(
+                f"Tabela '{nome}' não existe. Tabelas disponíveis: "
+                f"{', '.join(sorted(existentes))}."
+            )
+
+        descricoes = DESCRICOES.get(nome, {}).get("colunas", {})
+        chaves_estrangeiras = {
+            linha[3]: f"{linha[2]}.{linha[4]}"
+            for linha in conexao.execute(f'PRAGMA foreign_key_list("{nome}")')
+        }
+        colunas = []
+        for _, coluna, tipo, nao_nulo, _, chave_primaria in conexao.execute(
+            f'PRAGMA table_info("{nome}")'
+        ):
+            distintos, nulos, minimo, maximo = conexao.execute(
+                f'SELECT COUNT(DISTINCT "{coluna}"), SUM("{coluna}" IS NULL), '
+                f'MIN("{coluna}"), MAX("{coluna}") FROM "{nome}"'
+            ).fetchone()
+            info = {
+                "nome": coluna,
+                "tipo": tipo,
+                "descricao": descricoes.get(coluna, ""),
+                "aceita_nulo": not nao_nulo and not chave_primaria,
+                "valores_distintos": distintos,
+                "nulos": nulos or 0,
+            }
+            if chave_primaria:
+                info["chave_primaria"] = True
+            if coluna in chaves_estrangeiras:
+                info["referencia"] = chaves_estrangeiras[coluna]
+
+            if tipo == "TEXT" and distintos <= MAXIMO_VALORES_LISTADOS:
+                info["valores_possiveis"] = [linha[0] for linha in conexao.execute(
+                    f'SELECT DISTINCT "{coluna}" FROM "{nome}" '
+                    f'WHERE "{coluna}" IS NOT NULL ORDER BY 1'
+                )]
+            else:
+                info["minimo"] = minimo
+                info["maximo"] = maximo
+                info["exemplos"] = [linha[0] for linha in conexao.execute(
+                    f'SELECT DISTINCT "{coluna}" FROM "{nome}" '
+                    f'WHERE "{coluna}" IS NOT NULL LIMIT 3'
+                )]
+            colunas.append(info)
+
+        return {
+            "nome": nome,
+            "descricao": DESCRICOES.get(nome, {}).get("descricao", ""),
+            "colunas": colunas,
+        }
+    finally:
+        conexao.close()
 
 
 def executar_consulta(sql, caminho=CAMINHO_PADRAO, limite=LIMITE_LINHAS,
