@@ -1,0 +1,18 @@
+[project]
+name = "mcp-pedidos"
+version = "0.1.0"
+description = "Servidor MCP que expõe um banco SQLite de pedidos de delivery (dados fictícios) para consultas em linguagem natural pelo Claude."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.3,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,19 @@
+# Banco gerado por src/gerar_dados.py (recriável, não versionar)
+data/*.db
+data/*.db-journal
+
+# Ambiente virtual
+.venv/
+
+# Caches do Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Editores e sistema
+.vscode/
+.idea/
+.DS_Store
