@@ -37,14 +37,18 @@ def cliente_em_memoria(caminho_banco, monkeypatch):
 def test_ferramentas_publicadas(cliente_em_memoria):
     resposta = cliente_em_memoria(lambda c: c.list_tools())
     ferramentas = {f.name: f for f in resposta.tools}
-    assert set(ferramentas) == {"listar_tabelas", "descrever_tabela"}
+    assert set(ferramentas) == {"listar_tabelas", "descrever_tabela", "consultar", "resumo_periodo"}
     for ferramenta in ferramentas.values():
         assert len(ferramenta.description) > 80, "a descrição é o que o Claude lê"
         assert ferramenta.annotations.read_only_hint is True
         assert ferramenta.output_schema is not None
 
-    esquema_nome = ferramentas["descrever_tabela"].input_schema["properties"]["nome"]
-    assert esquema_nome["enum"] == ["restaurantes", "clientes", "pedidos", "itens_pedido"]
+    esquema_tabela = ferramentas["descrever_tabela"].input_schema["properties"]["tabela"]
+    assert esquema_tabela["enum"] == ["restaurantes", "clientes", "pedidos", "itens_pedido"]
+
+    descricao_consultar = ferramentas["consultar"].description
+    assert "200 linhas" in descricao_consultar and "5 segundos" in descricao_consultar
+    assert not descricao_consultar.startswith(" ")
 
 
 def test_listar_tabelas(cliente_em_memoria):
@@ -59,7 +63,7 @@ def test_listar_tabelas(cliente_em_memoria):
 
 def test_descrever_tabela(cliente_em_memoria):
     resultado = cliente_em_memoria(
-        lambda c: c.call_tool("descrever_tabela", {"nome": "pedidos"})
+        lambda c: c.call_tool("descrever_tabela", {"tabela": "pedidos"})
     )
     assert resultado.is_error is False
     colunas = {c["nome"]: c for c in resultado.structured_content["colunas"]}
@@ -75,7 +79,7 @@ def test_descrever_tabela(cliente_em_memoria):
 
 def test_descrever_tabela_inexistente_e_recusada(cliente_em_memoria):
     resultado = cliente_em_memoria(
-        lambda c: c.call_tool("descrever_tabela", {"nome": "sqlite_master"})
+        lambda c: c.call_tool("descrever_tabela", {"tabela": "sqlite_master"})
     )
     assert resultado.is_error is True
     assert "itens_pedido" in resultado.content[0].text  # mostra as opções válidas
@@ -114,6 +118,114 @@ def test_servidor_via_stdio(caminho_banco):
             return ferramentas, resultado
 
     ferramentas, resultado = asyncio.run(rodar())
-    assert {f.name for f in ferramentas.tools} == {"listar_tabelas", "descrever_tabela"}
+    assert len(ferramentas.tools) == 4
     assert resultado.is_error is False
     assert len(resultado.structured_content["tabelas"]) == 4
+
+
+# --- consultar -------------------------------------------------------------
+
+def test_consultar_agregacao(cliente_em_memoria):
+    sql = ("SELECT strftime('%Y-%m', data_hora) AS mes, COUNT(*) AS pedidos "
+           "FROM pedidos GROUP BY mes ORDER BY mes")
+    resultado = cliente_em_memoria(lambda c: c.call_tool("consultar", {"sql": sql}))
+    assert resultado.is_error is False
+    dados = resultado.structured_content
+    assert dados["colunas"] == ["mes", "pedidos"]
+    assert [linha[0] for linha in dados["linhas"]] == ["2026-08", "2026-09", "2026-10"]
+    assert sum(linha[1] for linha in dados["linhas"]) == 5000
+    assert dados["linhas_devolvidas"] == 3
+    assert dados["truncado"] is False
+    assert "aviso" not in dados
+
+
+def test_consultar_truncado_traz_aviso(cliente_em_memoria):
+    resultado = cliente_em_memoria(
+        lambda c: c.call_tool("consultar", {"sql": "SELECT id FROM pedidos"})
+    )
+    dados = resultado.structured_content
+    assert dados["truncado"] is True
+    assert dados["linhas_devolvidas"] == 200
+    assert "GROUP BY" in dados["aviso"]
+
+
+@pytest.mark.parametrize("sql, trecho", [
+    ("DELETE FROM pedidos", "consultas de leitura"),
+    ("SELECT 1; DROP TABLE pedidos", "apenas um comando"),
+    ("SELECT valor FROM pedidos", "no such column: valor"),
+    ("SELECT EXTRACT(MONTH FROM data_hora) FROM pedidos", "Erro do SQLite"),
+])
+def test_consultar_erros_chegam_legiveis_ao_modelo(cliente_em_memoria, caminho_banco, sql, trecho):
+    resultado = cliente_em_memoria(lambda c: c.call_tool("consultar", {"sql": sql}))
+    assert resultado.is_error is True
+    assert trecho in resultado.content[0].text
+    conexao = sqlite3.connect(caminho_banco)
+    try:
+        assert conexao.execute("SELECT COUNT(*) FROM pedidos").fetchone()[0] == 5000
+    finally:
+        conexao.close()
+
+
+# --- resumo_periodo --------------------------------------------------------
+
+def resumo_esperado(caminho, inicio, fim):
+    """Mesmas métricas calculadas com um SQL independente, escrito à mão."""
+    conexao = sqlite3.connect(caminho)
+    try:
+        return conexao.execute(
+            """
+            SELECT COUNT(*),
+                   SUM(status = 'cancelado'),
+                   ROUND(SUM(IIF(status = 'entregue', valor_total, 0)), 2),
+                   ROUND(SUM(IIF(status = 'entregue', valor_total, 0))
+                         / SUM(status = 'entregue'), 2),
+                   ROUND(AVG(tempo_entrega_min), 1),
+                   ROUND(AVG(nota), 2),
+                   ROUND(100.0 * SUM(status = 'cancelado') / COUNT(*), 1)
+            FROM pedidos WHERE date(data_hora) BETWEEN ? AND ?
+            """,
+            (inicio, fim),
+        ).fetchone()
+    finally:
+        conexao.close()
+
+
+@pytest.mark.parametrize("inicio, fim", [
+    ("2026-10-01", "2026-10-31"),
+    ("2026-08-01", "2026-10-31"),
+    ("2026-09-15", "2026-09-15"),  # um único dia: o dia final precisa entrar inteiro
+])
+def test_resumo_periodo_bate_com_sql_manual(cliente_em_memoria, caminho_banco, inicio, fim):
+    resultado = cliente_em_memoria(lambda c: c.call_tool(
+        "resumo_periodo", {"data_inicio": inicio, "data_fim": fim}
+    ))
+    assert resultado.is_error is False
+    r = resultado.structured_content
+    assert (r["pedidos"], r["cancelados"], r["faturamento"], r["ticket_medio"],
+            r["tempo_medio_entrega_min"], r["nota_media"], r["taxa_cancelamento_pct"]) \
+        == resumo_esperado(caminho_banco, inicio, fim)
+    assert r["entregues"] + r["cancelados"] == r["pedidos"]
+    assert "aviso" not in r
+
+
+def test_resumo_periodo_fora_dos_dados(cliente_em_memoria):
+    resultado = cliente_em_memoria(lambda c: c.call_tool(
+        "resumo_periodo", {"data_inicio": "2026-01-01", "data_fim": "2026-01-31"}
+    ))
+    r = resultado.structured_content
+    assert r["pedidos"] == 0
+    assert r["ticket_medio"] is None
+    assert "2026-08-01" in r["aviso"]
+
+
+@pytest.mark.parametrize("inicio, fim, trecho", [
+    ("01/10/2026", "2026-10-31", "AAAA-MM-DD"),
+    ("2026-10-01", "2026-10-32", "data_fim inválida"),
+    ("2026-10-31", "2026-10-01", "Inverta"),
+])
+def test_resumo_periodo_datas_invalidas(cliente_em_memoria, inicio, fim, trecho):
+    resultado = cliente_em_memoria(lambda c: c.call_tool(
+        "resumo_periodo", {"data_inicio": inicio, "data_fim": fim}
+    ))
+    assert resultado.is_error is True
+    assert trecho in resultado.content[0].text

@@ -10,6 +10,7 @@ Para rodar manualmente (fica esperando mensagens MCP na entrada padrão):
     uv run python src/servidor.py
 """
 
+import inspect
 import os
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -22,6 +23,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 import banco
+from validador import ConsultaInvalida
 
 # Permite apontar para outro arquivo (útil em testes); o padrão é data/pedidos.db.
 CAMINHO_BANCO = Path(os.environ.get("MCP_PEDIDOS_DB", banco.CAMINHO_PADRAO))
@@ -37,8 +39,14 @@ perguntas de negócio (volume de pedidos, faturamento, ticket médio, tempo de
 entrega, notas, cancelamentos) com números calculados a partir dos dados, em vez
 de estimar.
 
-Antes de escrever SQL, confira os nomes e o significado das colunas com
-listar_tabelas e descrever_tabela. O acesso é somente leitura.
+Fluxo sugerido:
+- Para as métricas padrão de um período (pedidos, faturamento, ticket médio,
+  tempo médio de entrega, nota média, taxa de cancelamento), use resumo_periodo.
+- Para qualquer outra pergunta, confira as colunas com listar_tabelas e
+  descrever_tabela e depois escreva a consulta SQL em consultar.
+
+O acesso é somente leitura. Ao responder, diga em que período e com qual
+critério o número foi calculado (por exemplo, se incluiu pedidos cancelados).
 """
 
 # Ferramentas que só leem dados. As anotações são dicas para o cliente
@@ -104,7 +112,9 @@ def listar_tabelas() -> ListaTabelas:
 
 @servidor.tool(title="Descrever tabela", annotations=SOMENTE_LEITURA)
 def descrever_tabela(
-    nome: Annotated[NomeTabela, Field(description="Nome exato da tabela a descrever.")],
+    # O parâmetro se chamava `nome`, mas no primeiro teste o Claude o chamou
+    # de `tabela` por conta própria; o nome mais óbvio para o modelo é o melhor.
+    tabela: Annotated[NomeTabela, Field(description="Nome exato da tabela a descrever.")],
 ) -> DescricaoTabela:
     """Mostra as colunas de uma tabela: tipo, significado, nulos e exemplos de valores.
 
@@ -117,7 +127,107 @@ def descrever_tabela(
     valor_total já incluir a taxa de entrega.
     """
     try:
-        return banco.descrever_tabela(nome, CAMINHO_BANCO)
+        return banco.descrever_tabela(tabela, CAMINHO_BANCO)
+    except banco.ErroConsulta as erro:
+        raise ToolError(str(erro)) from erro
+
+
+class ResultadoConsulta(TypedDict):
+    colunas: list[str]
+    linhas: list[list[Any]]
+    linhas_devolvidas: int
+    truncado: bool
+    aviso: NotRequired[str]
+
+
+# A descrição é montada com f-string para citar os limites reais; por isso
+# vai no parâmetro `description` do decorador (f-string não vira docstring).
+DESCRICAO_CONSULTAR = f"""Executa uma consulta SQL de leitura no banco de pedidos e devolve as linhas.
+
+    Use para qualquer pergunta que resumo_periodo não responda: rankings,
+    comparações por bairro, restaurante, categoria, hora ou dia da semana,
+    itens mais vendidos etc. Antes, confira nomes e regras das colunas com
+    descrever_tabela.
+
+    Regras:
+    - Só SELECT (ou WITH ... SELECT), um comando por vez; o banco é somente leitura.
+    - Dialeto SQLite: datas são texto, use strftime('%Y-%m', data_hora) para
+      mês, strftime('%H', data_hora) para hora e strftime('%w', data_hora)
+      para dia da semana (0 = domingo). Não existem EXTRACT nem DATE_TRUNC.
+    - Devolve no máximo {banco.LIMITE_LINHAS} linhas e a consulta é interrompida após
+      {banco.TEMPO_LIMITE_S:g} segundos. Agregue no próprio SQL (COUNT, SUM, AVG,
+      GROUP BY) e use ORDER BY ... LIMIT em rankings, em vez de trazer
+      linhas brutas.
+    - valor_total já inclui a taxa de entrega; filtre status = 'entregue'
+      quando a métrica não deve contar cancelados (faturamento, ticket médio).
+
+    Se a consulta falhar, a mensagem de erro diz o motivo (inclusive o erro
+    do SQLite, como coluna inexistente): corrija e tente de novo.
+    """
+
+
+@servidor.tool(title="Consultar com SQL", description=inspect.cleandoc(DESCRICAO_CONSULTAR),
+               annotations=SOMENTE_LEITURA)
+def consultar(
+    sql: Annotated[str, Field(description=(
+        "Um único comando SELECT (ou WITH ... SELECT) no dialeto do SQLite. "
+        "Sem ponto e vírgula entre comandos e sem comandos de escrita."
+    ))],
+) -> ResultadoConsulta:
+    try:
+        resultado = banco.executar_consulta(sql, CAMINHO_BANCO)
+    except (ConsultaInvalida, banco.ErroConsulta) as erro:
+        raise ToolError(str(erro)) from erro
+
+    resposta = {**resultado, "linhas_devolvidas": len(resultado["linhas"])}
+    if resultado["truncado"]:
+        resposta["aviso"] = (
+            f"O resultado tinha mais de {banco.LIMITE_LINHAS} linhas e foi cortado. "
+            "Agregue com GROUP BY ou use LIMIT para obter o número completo."
+        )
+    return resposta
+
+
+class ResumoPeriodo(TypedDict):
+    data_inicio: str
+    data_fim: str
+    pedidos: int
+    entregues: int
+    cancelados: int
+    faturamento: float
+    ticket_medio: float | None
+    tempo_medio_entrega_min: float | None
+    nota_media: float | None
+    taxa_cancelamento_pct: float | None
+    aviso: NotRequired[str]
+
+
+@servidor.tool(title="Resumo de um período", annotations=SOMENTE_LEITURA)
+def resumo_periodo(
+    data_inicio: Annotated[str, Field(description="Primeiro dia do período, AAAA-MM-DD (incluído).")],
+    data_fim: Annotated[str, Field(description="Último dia do período, AAAA-MM-DD (incluído).")],
+) -> ResumoPeriodo:
+    """Calcula as métricas padrão dos pedidos de um período, sem precisar de SQL.
+
+    Use quando a pergunta for sobre os indicadores gerais de um intervalo de
+    datas, como "como foi outubro?" ou "qual o ticket médio em setembro?".
+    Para um mês inteiro, passe o primeiro e o último dia do mês. Para
+    comparar períodos, chame uma vez para cada período. Para quebrar por
+    bairro, restaurante, hora etc., use consultar.
+
+    Definições das métricas:
+    - pedidos: todos os pedidos feitos no período (entregues + cancelados);
+    - faturamento: soma de valor_total dos pedidos entregues, em R$
+      (inclui taxa de entrega; cancelados não faturam);
+    - ticket_medio: faturamento dividido pelo número de pedidos entregues;
+    - tempo_medio_entrega_min: média, em minutos, dos pedidos entregues;
+    - nota_media: média das notas (1 a 5) dos pedidos entregues e avaliados;
+    - taxa_cancelamento_pct: cancelados / pedidos, em porcentagem.
+
+    Os dados cobrem de 2026-08-01 a 2026-10-31.
+    """
+    try:
+        return banco.resumo_periodo(data_inicio, data_fim, CAMINHO_BANCO)
     except banco.ErroConsulta as erro:
         raise ToolError(str(erro)) from erro
 

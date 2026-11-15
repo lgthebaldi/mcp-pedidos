@@ -15,6 +15,7 @@ Além disso, cada consulta tem limite de linhas devolvidas e de tempo.
 
 import sqlite3
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 from validador import validar_consulta
@@ -224,6 +225,81 @@ def descrever_tabela(nome, caminho=CAMINHO_PADRAO):
         }
     finally:
         conexao.close()
+
+
+def _ler_data(texto, nome_parametro):
+    try:
+        return date.fromisoformat(texto)
+    except (TypeError, ValueError):
+        raise ErroConsulta(
+            f"{nome_parametro} inválida: '{texto}'. Use o formato AAAA-MM-DD, "
+            "por exemplo 2026-10-01."
+        ) from None
+
+
+def resumo_periodo(data_inicio, data_fim, caminho=CAMINHO_PADRAO):
+    """Métricas padrão dos pedidos entre duas datas (ambas incluídas).
+
+    Definições:
+    - pedidos: total de pedidos feitos no período (entregues + cancelados);
+    - faturamento: soma de valor_total dos pedidos entregues;
+    - ticket_medio: faturamento / pedidos entregues;
+    - tempo_medio_entrega_min e nota_media: só pedidos entregues
+      (a nota, só dos avaliados);
+    - taxa_cancelamento_pct: cancelados / pedidos * 100.
+    """
+    inicio = _ler_data(data_inicio, "data_inicio")
+    fim = _ler_data(data_fim, "data_fim")
+    if inicio > fim:
+        raise ErroConsulta(
+            f"data_inicio ({inicio}) é posterior a data_fim ({fim}). Inverta as datas."
+        )
+
+    conexao = _abrir_conexao_interna(caminho)
+    try:
+        # Comparação de texto contra data_hora ('AAAA-MM-DD HH:MM:SS'): o
+        # limite superior é o dia seguinte ao fim, exclusivo, para incluir
+        # o dia final inteiro e ainda aproveitar o índice da coluna.
+        pedidos, entregues, cancelados, faturamento, tempo, nota = conexao.execute(
+            """
+            SELECT COUNT(*),
+                   SUM(status = 'entregue'),
+                   SUM(status = 'cancelado'),
+                   SUM(CASE WHEN status = 'entregue' THEN valor_total END),
+                   AVG(CASE WHEN status = 'entregue' THEN tempo_entrega_min END),
+                   AVG(CASE WHEN status = 'entregue' THEN nota END)
+            FROM pedidos
+            WHERE data_hora >= ? AND data_hora < ?
+            """,
+            (inicio.isoformat(), (fim + timedelta(days=1)).isoformat()),
+        ).fetchone()
+        primeiro, ultimo = conexao.execute(
+            "SELECT MIN(date(data_hora)), MAX(date(data_hora)) FROM pedidos"
+        ).fetchone()
+    finally:
+        conexao.close()
+
+    def arredondar(valor, casas=2):
+        return None if valor is None else round(valor, casas)
+
+    resumo = {
+        "data_inicio": inicio.isoformat(),
+        "data_fim": fim.isoformat(),
+        "pedidos": pedidos,
+        "entregues": entregues or 0,
+        "cancelados": cancelados or 0,
+        "faturamento": arredondar(faturamento) or 0.0,
+        "ticket_medio": arredondar(faturamento / entregues) if entregues else None,
+        "tempo_medio_entrega_min": arredondar(tempo, 1),
+        "nota_media": arredondar(nota),
+        "taxa_cancelamento_pct": arredondar(100 * cancelados / pedidos, 1) if pedidos else None,
+    }
+    if inicio.isoformat() < primeiro or fim.isoformat() > ultimo:
+        resumo["aviso"] = (
+            f"Os dados só cobrem de {primeiro} a {ultimo}; a parte do período "
+            "fora desse intervalo não tem pedidos."
+        )
+    return resumo
 
 
 def executar_consulta(sql, caminho=CAMINHO_PADRAO, limite=LIMITE_LINHAS,
